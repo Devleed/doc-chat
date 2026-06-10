@@ -6,6 +6,7 @@ from io import BytesIO
 from typing import Any, Iterable
 
 import cohere
+import docx
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -74,19 +75,38 @@ class QdrantRag:
             vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
         )
 
-    def _extract_pdf_pages(self, pdf_bytes: bytes, source_name: str) -> list[Document]:
-        reader = PdfReader(BytesIO(pdf_bytes))
+    def _extract_pdf_pages(self, file_bytes: bytes, source_name: str) -> list[Document]:
+        reader = PdfReader(BytesIO(file_bytes))
         pages: list[Document] = []
         for i, page in enumerate(reader.pages):
             text = page.extract_text() or ""
             pages.append(Document(page_content=text, metadata={"page": i + 1, "source": source_name}))
         return pages
 
-    def ingest_pdf(self, pdf_bytes: bytes, filename: str) -> str:
-        doc_id = str(uuid.uuid4())
-        print(f"Ingesting {filename} as doc_id {doc_id} with size {len(pdf_bytes)} bytes")
+    def _extract_text_pages(self, file_bytes: bytes, source_name: str) -> list[Document]:
+        text = file_bytes.decode("utf-8", errors="replace")
+        return [Document(page_content=text, metadata={"page": 1, "source": source_name})]
 
-        pages = self._extract_pdf_pages(pdf_bytes, source_name=filename)
+    def _extract_docx_pages(self, file_bytes: bytes, source_name: str) -> list[Document]:
+        doc = docx.Document(BytesIO(file_bytes))
+        text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return [Document(page_content=text, metadata={"page": 1, "source": source_name})]
+
+    def _extract_pages(self, file_bytes: bytes, filename: str) -> list[Document]:
+        ext = os.path.splitext(filename.lower())[1]
+        if ext == ".pdf":
+            return self._extract_pdf_pages(file_bytes, filename)
+        if ext in {".txt", ".md"}:
+            return self._extract_text_pages(file_bytes, filename)
+        if ext == ".docx":
+            return self._extract_docx_pages(file_bytes, filename)
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    def ingest_document(self, file_bytes: bytes, filename: str) -> str:
+        doc_id = str(uuid.uuid4())
+        print(f"Ingesting {filename} as doc_id {doc_id} with size {len(file_bytes)} bytes")
+
+        pages = self._extract_pages(file_bytes, filename)
         chunks = self.splitter.split_documents(pages)
 
         print(f"Extracted {len(pages)} pages and split into {len(chunks)} chunks")
@@ -96,8 +116,8 @@ class QdrantRag:
         point_ids: list[str] = []
 
         print("Processing chunks and preparing for embedding...")
-        for chunk_index, doc in enumerate(chunks):
-            cleaned = _clean_text(doc.page_content)
+        for chunk_index, chunk in enumerate(chunks):
+            cleaned = _clean_text(chunk.page_content)
             if not cleaned:
                 continue
             texts.append(cleaned)
@@ -105,8 +125,8 @@ class QdrantRag:
                 {
                     "doc_id": doc_id,
                     "chunk_index": chunk_index,
-                    "page": doc.metadata.get("page"),
-                    "source": doc.metadata.get("source"),
+                    "page": chunk.metadata.get("page"),
+                    "source": chunk.metadata.get("source"),
                     "text": cleaned,
                 }
             )
@@ -114,7 +134,7 @@ class QdrantRag:
 
         if not texts:
             return doc_id
-        
+
         print(f"Embedding {len(texts)} chunks...")
 
         vectors = self.embeddings.embed_documents(texts)
@@ -127,6 +147,9 @@ class QdrantRag:
 
         self.client.upsert(collection_name=self.settings.collection_name, points=points)
         return doc_id
+
+    def ingest_pdf(self, pdf_bytes: bytes, filename: str) -> str:
+        return self.ingest_document(pdf_bytes, filename)
 
     def _scroll_doc_chunks(self, doc_id: str, limit: int = 10_000) -> list[dict[str, Any]]:
         flt = Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))])
@@ -204,14 +227,13 @@ class QdrantRag:
             combined.append(item)
         return self._rerank(query=query, candidates=combined, top_n=final_k)
 
-    def ask(self, question: str, doc_id: str, fetch_k: int = 6, final_k: int = 3) -> dict[str, Any]:
+    def _build_chain(self) -> tuple[Any, Any]:
         llm = ChatOpenAI(model=self.settings.llm_model, temperature=0, openai_api_key=self.settings.openai_api_key)
         prompt = ChatPromptTemplate.from_template(
             """
 You are a document assistant.
 Answer the question using ONLY the document excerpts below.
 
-For every claim you make, cite the chunk like this: [Chunk 1], [Chunk 2].
 If the answer is truly not in the excerpts, say "This information is not in the document."
 
 Document excerpts:
@@ -220,7 +242,10 @@ Document excerpts:
 Question: {question}
 """.strip()
         )
+        return prompt, llm
 
+    def ask(self, question: str, doc_id: str, fetch_k: int = 6, final_k: int = 3) -> dict[str, Any]:
+        prompt, llm = self._build_chain()
         results = self.retrieve(query=question, doc_id=doc_id, fetch_k=fetch_k, final_k=final_k)
         context = "\n\n".join([f"[Chunk {i+1}]: {r.get('text','')}" for i, r in enumerate(results)])
 
@@ -230,4 +255,22 @@ Question: {question}
             "answer": getattr(response, "content", str(response)),
             "sources": results,
         }
+
+    def ask_stream(self, question: str, doc_id: str, fetch_k: int = 6, final_k: int = 3) -> Iterable[str]:
+        """Yields SSE-formatted strings: text chunks then a final sources event."""
+        import json
+
+        prompt, llm = self._build_chain()
+        results = self.retrieve(query=question, doc_id=doc_id, fetch_k=fetch_k, final_k=final_k)
+
+        context = "\n\n".join([f"[Chunk {i+1}]: {r.get('text','')}" for i, r in enumerate(results)])
+
+        chain = prompt | llm
+        for chunk in chain.stream({"context": context, "question": question}):
+            content = getattr(chunk, "content", None)
+            if content:
+                yield f"data: {json.dumps({'type': 'text', 'content': content})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'sources', 'sources': results})}\n\n"
+        yield "data: [DONE]\n\n"
 
